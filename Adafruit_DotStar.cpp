@@ -209,19 +209,105 @@ void Adafruit_DotStar::show(void) {
   if(dataPin == USE_HW_SPI) {
 
 #ifdef SPI_PIPELINE
-    uint8_t next;
-    for(i=0; i<3; i++) spi_out(0x00);    // First 3 start-frame bytes
-    SPDR = 0x00;                         // 4th is pipelined
-    do {                                 // For each pixel...
-      while(!(SPSR & _BV(SPIF)));        //  Wait for prior byte out
-      SPDR = 0xFF;                       //  Pixel start
-      for(i=0; i<3; i++) {               //  For R,G,B...
-        next = brightness ? (*ptr++ * b16) >> 8 : *ptr++; // Read, scale
-        while(!(SPSR & _BV(SPIF)));      //   Wait for prior byte out
-        SPDR = next;                     //   Write scaled color
-      }
-    } while(--n);
-    while(!(SPSR & _BV(SPIF)));          // Wait for last byte out
+	
+	uint8_t b8 = brightness;            // no need to type convert
+	uint8_t i;                          // Loop counter
+	uint8_t j;                          // Scratch high reg
+    
+	asm volatile (
+    
+		"ldi %[j],0x00            \n\t"  // 1   1 - First send the 4 0x00 start-frame maker bytes for each pixel
+		"out %[spdr],%[j]         \n\t"  // 1   1 - Send 1st byte inline without delay. Every cycle counts!
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"call SEND_J_18%=         \n\t"
+		"call SEND_J_18%=         \n\t"
+		"call SEND_J_18%=         \n\t"
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+    
+		"LOOP_LEN_%=: \n\t"                  //       * Loop though each pixel in buffer where each pixel is 3 bytes
+    
+		"ldi %[j],0xff            \n\t"  // 1   1 - First send the 0xff start byte for each pixel
+    
+		"call SEND_J_3%=          \n\t"  
+
+		"ldi %[i],3               \n\t"  // 1   1 - Send 3 color bytes (r,g,b)
+		"LOOP_RGB_%=:             \n\t"
+    
+		"ld __tmp_reg__,%a[buf]+  \n\t"  // 2   2 - load next byte from buffer, increment pointer
+		"and %[b8],%[b8]          \n\t"  // 1   1 - test if global brightness zero
+		"breq BR_ZERO_%=          \n\t"  // 1   2 - Easy case if 0
+		"mul %[b8],__tmp_reg__    \n\t"  // 2   0 - 2 byte multipuly brightness * color value. R1 now holds the high byte of the result, which is our answer
+		"rjmp READY_TO_SEND_%=    \n\t"  // 2   0
+    
+		"BR_ZERO_%=:              \n\t"
+		"mov r1,__tmp_reg__       \n\t"  // 0   1 - If we get here, global brightness was zero, so just use straight value
+		"rjmp .+0                 \n\t"  // 0   2 - Waste the time we saved by skipping a MUL
+    
+		"READY_TO_SEND_%=:        \n\t"
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+    
+		"out %[spdr],r1           \n\t"  // 1   1 - Send color byte!
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+    
+		"dec %[i]                 \n\t"  // 1   1 - decrement RGB loop counter
+		"brne LOOP_RGB_%=         \n\t"  // 1   2 - repeat for each of 3 color bytes in this pxiel
+    
+		"sbiw %[len], 1           \n\t"    // 2   2 - any more pixels in buffer?
+		"brne LOOP_LEN_%=         \n\t"    // 1   1
+
+		// Send four end-of-frame bytes
+
+		"ldi %[j],0xff                \n\t"  // 1   1 - First send the 4 0x00 start-frame maker bytes for each pixel
+		"call SEND_J_2%=              \n\t"
+		"call SEND_J_18%=               \n\t"
+		"call SEND_J_18%=               \n\t"
+		"call SEND_J_18%=               \n\t"
+    
+		"rjmp DONE_%=                 \n\t"  // 1   1 - Restore r1 to zero - other C code depends on this
+    
+		"SEND_J_18%=:                   \n\t"  //       - Total delay bewteen consecutive calls is 18 cycles. (8 cycles on call/ret)
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+    
+		"SEND_J_2%=:                  \n\t"  //       - Total delay bewteen consecutive calls is 14 cycles
+		"nop                      \n\t"  // 1   1 - Twiddle thumb   delay(7)
+
+		"SEND_J_3%=:                  \n\t"  //       - Total delay bewteen consecutive calls is 13 cycles
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+		"rjmp .+0                 \n\t"  // 2   2 - Twiddle thumbs
+    
+		"SEND_J_QUICK%=:              \n\t"  //       - Call with no predelay for the 1st pass. 4 cycles in - 1 cycle send - 4 cycles out.
+		"out %[spdr],%[j]         \n\t"  // 1   1 - Send whatever is in J
+		"ret                      \n\t"  // 4   4 - Return takes 4 cycles
+    
+		"DONE_%=:                   \n\t"
+		"eor r1,r1                  \n\t"    // 1   1 - Restore r1 to zero - other C code depends on this
+    
+		: // Outputs: (these are actually inputs, but we mark as read/write output since they get changed during execution)
+		// "there is no way to specify that input operands get modified without also specifying them as output operands."
+    
+		[buf] "+e" (ptr), // pointer to buffer
+		[len] "+w" (n) // length of buffer
+    
+		: // Inputs:
+		"[buf]" (ptr), // pointer to buffer
+		"[len]" (n),   // length of buffer
+
+		[i] "d" (i),   // loop counter (must be r16<=i<=r31)
+		[j] "d" (j),   // scratch (must be r16<=i<=r31)
+
+		[b8] "r"  (b8),  // brightness
+    
+		[spdr] "I" (_SFR_IO_ADDR(SPDR)) // SPI data register
+    
+		: // Clobbers
+		"cc" // special name that indicates that flags may have been clobbered
+    
+	);
+
 #else
     for(i=0; i<4; i++) spi_out(0x00);    // 4 byte start-frame marker
     if(brightness) {                     // Scale pixel brightness on output
@@ -235,13 +321,14 @@ void Adafruit_DotStar::show(void) {
         for(i=0; i<3; i++) spi_out(*ptr++); // Write R,G,B
       } while(--n);
     }
-#endif
     // Four end-frame bytes are seemingly indistinguishable from a white
     // pixel, and empirical testing suggests it can be left out...but it's
     // always a good idea to follow the datasheet, in case future hardware
     // revisions are more strict (e.g. might mandate use of end-frame
     // before start-frame marker).  i.e. let's not remove this.
     for(i=0; i<4; i++) spi_out(0xFF);
+	
+#endif
 
   } else {                               // Soft (bitbang) SPI
 
